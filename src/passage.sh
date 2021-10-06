@@ -1,24 +1,19 @@
 #!/usr/bin/env bash
 
 # Copyright (C) 2012 - 2018 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+# Copyright (C) 2021 Graeme Holliday <graeme.holliday@pm.me>. All Rights Reserved.
 # This file is licensed under the GPLv2+. Please see COPYING for more information.
 
-umask "${PASSWORD_STORE_UMASK:-077}"
+umask "${PASSAGE_UMASK:-077}"
 set -o pipefail
 
-GPG_OPTS=( $PASSWORD_STORE_GPG_OPTS "--quiet" "--yes" "--compress-algo=none" "--no-encrypt-to" )
-GPG="gpg"
-export GPG_TTY="${GPG_TTY:-$(tty 2>/dev/null)}"
-command -v gpg2 &>/dev/null && GPG="gpg2"
-[[ -n $GPG_AGENT_INFO || $GPG == "gpg2" ]] && GPG_OPTS+=( "--batch" "--use-agent" )
-
-PREFIX="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
-EXTENSIONS="${PASSWORD_STORE_EXTENSIONS_DIR:-$PREFIX/.extensions}"
-X_SELECTION="${PASSWORD_STORE_X_SELECTION:-clipboard}"
-CLIP_TIME="${PASSWORD_STORE_CLIP_TIME:-45}"
-GENERATED_LENGTH="${PASSWORD_STORE_GENERATED_LENGTH:-25}"
-CHARACTER_SET="${PASSWORD_STORE_CHARACTER_SET:-[:punct:][:alnum:]}"
-CHARACTER_SET_NO_SYMBOLS="${PASSWORD_STORE_CHARACTER_SET_NO_SYMBOLS:-[:alnum:]}"
+PREFIX="${PASSAGE_DIR:-$HOME/.passage}"
+EXTENSIONS="${PASSAGE_EXTENSIONS_DIR:-$PREFIX/.extensions}"
+X_SELECTION="${PASSAGE_X_SELECTION:-clipboard}"
+CLIP_TIME="${PASSAGE_CLIP_TIME:-45}"
+GENERATED_LENGTH="${PASSAGE_GENERATED_LENGTH:-25}"
+CHARACTER_SET="${PASSAGE_CHARACTER_SET:-[:punct:][:alnum:]}"
+CHARACTER_SET_NO_SYMBOLS="${PASSAGE_CHARACTER_SET_NO_SYMBOLS:-[:alnum:]}"
 
 unset GIT_DIR GIT_WORK_TREE GIT_NAMESPACE GIT_INDEX_FILE GIT_INDEX_VERSION GIT_OBJECT_DIRECTORY GIT_COMMON_DIR
 export GIT_CEILING_DIRECTORIES="$PREFIX/.."
@@ -55,89 +50,6 @@ yesno() {
 die() {
 	echo "$@" >&2
 	exit 1
-}
-verify_file() {
-	[[ -n $PASSWORD_STORE_SIGNING_KEY ]] || return 0
-	[[ -f $1.sig ]] || die "Signature for $1 does not exist."
-	local fingerprints="$($GPG $PASSWORD_STORE_GPG_OPTS --verify --status-fd=1 "$1.sig" "$1" 2>/dev/null | sed -n 's/^\[GNUPG:\] VALIDSIG \([A-F0-9]\{40\}\) .* \([A-F0-9]\{40\}\)$/\1\n\2/p')"
-	local fingerprint found=0
-	for fingerprint in $PASSWORD_STORE_SIGNING_KEY; do
-		[[ $fingerprint =~ ^[A-F0-9]{40}$ ]] || continue
-		[[ $fingerprints == *$fingerprint* ]] && { found=1; break; }
-	done
-	[[ $found -eq 1 ]] || die "Signature for $1 is invalid."
-}
-set_gpg_recipients() {
-	GPG_RECIPIENT_ARGS=( )
-	GPG_RECIPIENTS=( )
-	local gpg_id
-
-	if [[ -n $PASSWORD_STORE_KEY ]]; then
-		for gpg_id in $PASSWORD_STORE_KEY; do
-			GPG_RECIPIENT_ARGS+=( "-r" "$gpg_id" )
-			GPG_RECIPIENTS+=( "$gpg_id" )
-		done
-		return
-	fi
-
-	local current="$PREFIX/$1"
-	while [[ $current != "$PREFIX" && ! -f $current/.gpg-id ]]; do
-		current="${current%/*}"
-	done
-	current="$current/.gpg-id"
-
-	if [[ ! -f $current ]]; then
-		cat >&2 <<-_EOF
-		Error: You must run:
-		    $PROGRAM init your-gpg-id
-		before you may use the password store.
-
-		_EOF
-		cmd_usage
-		exit 1
-	fi
-
-	verify_file "$current"
-
-	while read -r gpg_id; do
-		gpg_id="${gpg_id%%#*}" # strip comment
-		[[ -n $gpg_id ]] || continue
-		GPG_RECIPIENT_ARGS+=( "-r" "$gpg_id" )
-		GPG_RECIPIENTS+=( "$gpg_id" )
-	done < "$current"
-}
-
-reencrypt_path() {
-	local prev_gpg_recipients="" gpg_keys="" current_keys="" index passfile
-	local groups="$($GPG $PASSWORD_STORE_GPG_OPTS --list-config --with-colons | grep "^cfg:group:.*")"
-	while read -r -d "" passfile; do
-		[[ -L $passfile ]] && continue
-		local passfile_dir="${passfile%/*}"
-		passfile_dir="${passfile_dir#$PREFIX}"
-		passfile_dir="${passfile_dir#/}"
-		local passfile_display="${passfile#$PREFIX/}"
-		passfile_display="${passfile_display%.gpg}"
-		local passfile_temp="${passfile}.tmp.${RANDOM}.${RANDOM}.${RANDOM}.${RANDOM}.--"
-
-		set_gpg_recipients "$passfile_dir"
-		if [[ $prev_gpg_recipients != "${GPG_RECIPIENTS[*]}" ]]; then
-			for index in "${!GPG_RECIPIENTS[@]}"; do
-				local group="$(sed -n "s/^cfg:group:$(sed 's/[\/&]/\\&/g' <<<"${GPG_RECIPIENTS[$index]}"):\\(.*\\)\$/\\1/p" <<<"$groups" | head -n 1)"
-				[[ -z $group ]] && continue
-				IFS=";" eval 'GPG_RECIPIENTS+=( $group )' # http://unix.stackexchange.com/a/92190
-				unset "GPG_RECIPIENTS[$index]"
-			done
-			gpg_keys="$($GPG $PASSWORD_STORE_GPG_OPTS --list-keys --with-colons "${GPG_RECIPIENTS[@]}" | sed -n 's/^sub:[^idr:]*:[^:]*:[^:]*:\([^:]*\):[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:[a-zA-Z]*e[a-zA-Z]*:.*/\1/p' | LC_ALL=C sort -u)"
-		fi
-		current_keys="$(LC_ALL=C $GPG $PASSWORD_STORE_GPG_OPTS -v --no-secmem-warning --no-permission-warning --decrypt --list-only --keyid-format long "$passfile" 2>&1 | sed -nE 's/^gpg: public key is ([A-F0-9]+)$/\1/p' | LC_ALL=C sort -u)"
-
-		if [[ $gpg_keys != "$current_keys" ]]; then
-			echo "$passfile_display: reencrypting to ${gpg_keys//$'\n'/ }"
-			$GPG -d "${GPG_OPTS[@]}" "$passfile" | $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile_temp" "${GPG_OPTS[@]}" &&
-			mv "$passfile_temp" "$passfile" || rm -f "$passfile_temp"
-		fi
-		prev_gpg_recipients="${GPG_RECIPIENTS[*]}"
-	done < <(find "$1" -path '*/.git' -prune -o -path '*/.extensions' -prune -o -iname '*.gpg' -print0)
 }
 check_sneaky_paths() {
 	local path
@@ -260,14 +172,13 @@ source "$(dirname "$0")/platform/$(uname | cut -d _ -f 1 | tr '[:upper:]' '[:low
 cmd_version() {
 	cat <<-_EOF
 	============================================
-	= pass: the standard unix password manager =
+	=    passage: a modern password manager    =
 	=                                          =
-	=                  v1.7.4                  =
+	=                   v1.0                   =
 	=                                          =
-	=             Jason A. Donenfeld           =
-	=               Jason@zx2c4.com            =
+	=              Graeme Holliday             =
+	=            graeme.holliday@pm.me         =
 	=                                          =
-	=      http://www.passwordstore.org/       =
 	============================================
 	_EOF
 }
@@ -277,9 +188,8 @@ cmd_usage() {
 	echo
 	cat <<-_EOF
 	Usage:
-	    $PROGRAM init [--path=subfolder,-p subfolder] gpg-id...
-	        Initialize new password storage and use gpg-id for encryption.
-	        Selectively reencrypt existing passwords using new gpg-id.
+	    $PROGRAM init [--path=subfolder,-p subfolder]
+	        Initialize new password store. Creates a new encrypted age key.
 	    $PROGRAM [ls] [subfolder]
 	        List passwords.
 	    $PROGRAM find pass-names...
@@ -303,9 +213,9 @@ cmd_usage() {
 	    $PROGRAM rm [--recursive,-r] [--force,-f] pass-name
 	        Remove existing password or directory, optionally forcefully.
 	    $PROGRAM mv [--force,-f] old-path new-path
-	        Renames or moves old-path to new-path, optionally forcefully, selectively reencrypting.
+	        Renames or moves old-path to new-path, optionally forcefully.
 	    $PROGRAM cp [--force,-f] old-path new-path
-	        Copies old-path to new-path, optionally forcefully, selectively reencrypting.
+	        Copies old-path to new-path, optionally forcefully.
 	    $PROGRAM git git-command-args...
 	        If the password store is a git repository, execute a git command
 	        specified by git-command-args.
@@ -313,8 +223,6 @@ cmd_usage() {
 	        Show this text.
 	    $PROGRAM version
 	        Show version information.
-
-	More information may be found in the pass(1) man page.
 	_EOF
 }
 
@@ -349,9 +257,9 @@ cmd_init() {
 		local id_print="$(printf "%s, " "$@")"
 		echo "Password store initialized for ${id_print%, }${id_path:+ ($id_path)}"
 		git_add_file "$gpg_id" "Set GPG id to ${id_print%, }${id_path:+ ($id_path)}."
-		if [[ -n $PASSWORD_STORE_SIGNING_KEY ]]; then
+		if [[ -n $PASSAGE_SIGNING_KEY ]]; then
 			local signing_keys=( ) key
-			for key in $PASSWORD_STORE_SIGNING_KEY; do
+			for key in $PASSAGE_SIGNING_KEY; do
 				signing_keys+=( --default-key $key )
 			done
 			$GPG "${GPG_OPTS[@]}" "${signing_keys[@]}" --detach-sign "$gpg_id" || die "Could not sign .gpg_id."
@@ -360,9 +268,6 @@ cmd_init() {
 			git_add_file "$gpg_id.sig" "Signing new GPG id with ${key//[$IFS]/,}."
 		fi
 	fi
-
-	reencrypt_path "$PREFIX/$id_path"
-	git_add_file "$PREFIX/$id_path" "Reencrypt password store using new GPG id ${id_print%, }${id_path:+ ($id_path)}."
 }
 
 cmd_show() {
@@ -627,7 +532,6 @@ cmd_copy_move() {
 	set_git "$new_path"
 	if [[ $move -eq 1 ]]; then
 		mv $interactive -v "$old_path" "$new_path" || exit 1
-		[[ -e "$new_path" ]] && reencrypt_path "$new_path"
 
 		set_git "$new_path"
 		if [[ -n $INNER_GIT_DIR && ! -e $old_path ]]; then
@@ -644,7 +548,6 @@ cmd_copy_move() {
 		rmdir -p "$old_dir" 2>/dev/null
 	else
 		cp $interactive -r -v "$old_path" "$new_path" || exit 1
-		[[ -e "$new_path" ]] && reencrypt_path "$new_path"
 		git_add_file "$new_path" "Copy ${1} to ${2}."
 	fi
 }
@@ -681,7 +584,7 @@ cmd_extension() {
 	check_sneaky_paths "$1"
 	local user_extension system_extension extension
 	[[ -n $SYSTEM_EXTENSION_DIR ]] && system_extension="$SYSTEM_EXTENSION_DIR/$1.bash"
-	[[ $PASSWORD_STORE_ENABLE_EXTENSIONS == true ]] && user_extension="$EXTENSIONS/$1.bash"
+	[[ $PASSAGE_ENABLE_EXTENSIONS == true ]] && user_extension="$EXTENSIONS/$1.bash"
 	if [[ -n $user_extension && -f $user_extension && -x $user_extension ]]; then
 		verify_file "$user_extension"
 		extension="$user_extension"
